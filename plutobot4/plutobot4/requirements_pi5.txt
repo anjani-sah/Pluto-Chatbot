@@ -1,0 +1,38 @@
+# Core Python packages for Pluto Bot
+openai>=1.12.0
+SpeechRecognition>=3.10.0
+pygame>=2.5.0
+numpy>=1.24.0
+requests>=2.31.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.21.0
+paho-mqtt>=1.6.0
+webrtcvad>=2.0.10
+pyaudio>=0.2.11
+hashlib-compat>=1.0.0
+
+# Raspberry Pi specific packages
+# Install these on Pi 5 for optimal performance:
+psutil>=5.9.0           # System monitoring and optimization
+RPi.GPIO>=0.7.1         # GPIO control (Pi only)
+adafruit-circuitpython-dht>=3.7.0  # DHT22 sensor support
+
+# Serial communication for Xiao ESP32-C3
+pyserial>=3.5
+
+# Audio processing optimization
+sounddevice>=0.4.6      # Alternative audio interface
+librosa>=0.10.0         # Advanced audio processing (optional)
+
+# System audio dependencies for Raspberry Pi 5:
+# These should be installed via apt on the Pi:
+# sudo apt update
+# sudo apt install -y python3-pip python3-dev
+# sudo apt install -y portaudio19-dev python3-pyaudio
+# sudo apt install -y pipewire pipewire-pulse pipewire-alsa
+# sudo apt install -y alsa-utils pulseaudio-utils
+# sudo apt install -y ffmpeg  # For audio format conversion
+
+# For development/testing:
+jupyter>=1.0.0          # Optional: for development
+matplotlib>=3.7.0       # Optional: for audio visualization

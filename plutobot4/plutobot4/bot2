@@ -1,0 +1,2162 @@
+from openai import OpenAI
+import speech_recognition as sr
+import numpy as np
+import pygame
+import time
+import threading
+import queue
+import requests
+import traceback  # Added for error handling
+from difflib import SequenceMatcher
+import hashlib
+import os
+from fuzzywuzzy import fuzz
+import paho.mqtt.client as mqtt   # <-- NEW
+import webrtcvad
+import collections
+import audioop
+import pyaudio  # <-- Phase 2 streaming import
+import socket   # <-- added to catch socket.timeout
+import json     # <-- memory persistence
+import re       # <-- intent regex
+from datetime import datetime, timedelta  # <-- added for short-term context pruning
+import serial   # <-- added for Xiao ESP32-C3 eye control communication
+import sounddevice  # <-- fixes ALSA errors on Raspberry Pi
+import gc  # <-- garbage collection for memory optimization
+import subprocess  # <-- for system commands
+import platform  # <-- for platform detection
+
+# Platform detection and optimization
+IS_RASPBERRY_PI = False
+AUDIO_SYSTEM = "unknown"
+
+def detect_platform():
+    """Detect if running on Raspberry Pi and what audio system is used"""
+    global IS_RASPBERRY_PI, AUDIO_SYSTEM
+    
+    try:
+        # Check if running on Raspberry Pi
+        with open('/proc/device-tree/model', 'r') as f:
+            model = f.read()
+            if 'Raspberry Pi' in model:
+                IS_RASPBERRY_PI = True
+                print(f"🔧 Running on {model.strip()}")
+            else:
+                IS_RASPBERRY_PI = False
+    except:
+        # Check CPU architecture as fallback
+        machine = platform.machine().lower()
+        IS_RASPBERRY_PI = 'arm' in machine
+        if IS_RASPBERRY_PI:
+            print(f"🔧 Running on ARM architecture: {machine}")
+        else:
+            print(f"🔧 Running on {platform.system()} {machine}")
+    
+    # Detect audio system
+    if IS_RASPBERRY_PI:
+        try:
+            # Check for PipeWire (Pi 5 default)
+            result = subprocess.run(['systemctl', '--user', 'is-active', 'pipewire'], 
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                AUDIO_SYSTEM = "pipewire"
+            else:
+                # Check for PulseAudio
+                result = subprocess.run(['pulseaudio', '--check'], 
+                                      capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    AUDIO_SYSTEM = "pulseaudio"
+                else:
+                    AUDIO_SYSTEM = "alsa"
+        except:
+            AUDIO_SYSTEM = "alsa"
+        
+        print(f"🔧 Audio system detected: {AUDIO_SYSTEM}")
+    else:
+        AUDIO_SYSTEM = "default"
+
+# Initialize platform detection
+detect_platform()
+
+# DHT22 sensor integration
+try:
+    from dht22_sensor import DHT22Sensor, get_room_conditions
+    dht22_sensor = DHT22Sensor()
+    DHT22_AVAILABLE = True
+    print("DHT22 sensor initialized successfully")
+except Exception as e:
+    print(f"DHT22 sensor not available: {e}")
+    dht22_sensor = None
+    DHT22_AVAILABLE = False
+
+# -------------------------
+# CONFIGURATION
+# -------------------------
+language = 'en'
+
+# Debug mode - set to False for production (temporarily True to show performance improvements)
+DEBUG_MODE = True
+
+# Voice configuration
+AVAILABLE_VOICES = {
+    "echo": "male",      # Current default (male)
+    "alloy": "neutral",  # Neutral voice
+    "nova": "female",    # Female voice
+    "shimmer": "female", # Female voice (alternative)
+    "fable": "female",   # Female voice (storytelling)
+    "onyx": "male"       # Male voice (alternative)
+}
+
+# Current voice setting - can be changed during runtime
+CURRENT_VOICE = "echo"  # Default voice
+
+def set_voice(voice_name):
+    """Set the TTS voice"""
+    global CURRENT_VOICE
+    if voice_name.lower() in AVAILABLE_VOICES:
+        CURRENT_VOICE = voice_name.lower()
+        return True
+    return False
+
+def get_current_voice():
+    """Get current voice and its type"""
+    return CURRENT_VOICE, AVAILABLE_VOICES.get(CURRENT_VOICE, "unknown")
+
+def debug_print(message):
+    """Print debug messages only if DEBUG_MODE is True"""
+    if DEBUG_MODE:
+        print(f"[DEBUG] {message}")
+
+# Directly use your API key here
+api_key = "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"
+
+client = OpenAI(api_key=api_key)
+
+# Persistent memory file
+MEMORY_PATH = "pluto_memory.json"
+MAX_RECENT_HISTORY_SECONDS = 300   # 5 min window
+MAX_RECENT_ITEMS = 40              # hard cap
+
+# Google Custom Search API key + CSE ID (fill CX before use)
+GOOGLE_SEARCH_API_KEY = "AIzaSyAbq8XwJzyN9O-3PYWW7Y7V8Cyg9hgjHPA"
+GOOGLE_CSE_ID = "e739fcd309b284834"  # extracted from script tag
+
+# -------------------------
+# Persistent Memory (User Preferences)
+# -------------------------
+PREF_KEY = "preferences"
+# Map spoken category tokens to canonical keys
+PREFERENCE_CATEGORIES = {
+    "food": "favorite_food",
+    "color": "favorite_color",
+    "colour": "favorite_color",
+    "song": "favorite_song",
+    "movie": "favorite_movie",
+    "film": "favorite_movie",
+    "game": "favorite_game",
+    "drink": "favorite_drink",
+    "sport": "favorite_sport",
+    "artist": "favorite_artist",
+    "show": "favorite_show",
+    "place": "favorite_place"
+}
+
+def _load_memory():
+    if not os.path.exists(MEMORY_PATH):
+        return {PREF_KEY: {}}
+    try:
+        with open(MEMORY_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if PREF_KEY not in data:
+                data[PREF_KEY] = {}
+            return data
+    except Exception:
+        return {PREF_KEY: {}}
+
+def _save_memory(mem):
+    try:
+        with open(MEMORY_PATH, 'w', encoding='utf-8') as f:
+            json.dump(mem, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[memory] save failed: {e}")
+
+def remember_preference(category_key: str, value: str):
+    mem = _load_memory()
+    mem[PREF_KEY][category_key] = value.strip()
+    _save_memory(mem)
+
+
+def get_preference(category_key: str):
+    mem = _load_memory()
+    return mem.get(PREF_KEY, {}).get(category_key)
+
+
+def list_preferences():
+    mem = _load_memory().get(PREF_KEY, {})
+    return mem
+
+# Pre-compiled regex patterns for faster matching
+REMEMBER_PATTERNS = [
+    re.compile(r"^remember my (favorite|fav) (\w+) is (.+)$"),
+    re.compile(r"^remember that my (favorite|fav) (\w+) is (.+)$"),
+    re.compile(r"^my (favorite|fav) (\w+) is (.+)$"),
+    re.compile(r"^set my (favorite|fav) (\w+) to (.+)$")
+]
+
+ASK_PATTERNS = [
+    re.compile(r"^what'?s my (favorite|fav) (\w+)[?]?$"),
+    re.compile(r"^what is my (favorite|fav) (\w+)[?]?$"),
+    re.compile(r"^do you remember my (favorite|fav) (\w+)[?]?$"),
+]
+
+def parse_remember_intent(text: str):
+    tl = text.lower().strip()
+    for pat in REMEMBER_PATTERNS:
+        m = pat.match(tl)  # Use pre-compiled pattern
+        if m:
+            cat = m.group(2)
+            val = m.group(3).strip().strip('.! ') if len(m.groups()) >= 3 else None
+            key = PREFERENCE_CATEGORIES.get(cat)
+            if key and val:
+                return key, val
+    return None, None
+
+def parse_recall_intent(text: str):
+    tl = text.lower().strip()
+    for pat in ASK_PATTERNS:
+        m = pat.match(tl)  # Use pre-compiled pattern
+        if m:
+            cat = m.group(2)
+            key = PREFERENCE_CATEGORIES.get(cat)
+            if key:
+                return key
+    # Broad queries like "what do you remember about me" / "what do you know about me"
+    if any(p in tl for p in ["what do you remember about me", "what do you know about me", "what do you remember", "what all do you remember about me"]):
+        return "__list_all__"
+    return None
+
+# Short-term session context window (pruned by time + length)
+SHORT_TERM_MAX_MINUTES = 5
+SHORT_TERM_MAX_TURNS = 20  # user+assistant pairs
+
+# -------------------------
+# Speech recognition (tuned for faster wake detection)
+r = sr.Recognizer()
+# Base thresholds kept but VAD will gate
+r.energy_threshold = 28
+r.dynamic_energy_threshold = True
+# Ultra-optimized for maximum responsiveness
+r.pause_threshold = 0.25  # Reduced from 0.35 for ultra-quick recognition
+r.non_speaking_duration = 0.15  # Reduced from 0.2 for faster detection
+# Reduced timeout from 4 to 3 seconds for faster failures and retries
+r.operation_timeout = 3
+
+# --- VAD + Wake Preprocessing Additions ---
+vad = webrtcvad.Vad(3)  # Changed from 2 to 3 (most aggressive for fastest detection)
+FRAME_DURATION_MS = 30  # ms per frame
+SAMPLE_RATE = 16000
+CHANNELS = 1
+MAX_BUFFER_MS = 4000
+MAX_FRAMES = int(MAX_BUFFER_MS / FRAME_DURATION_MS)
+
+# Phase 2 streaming constants - optimized for speed
+STREAM_FRAME_MS = 20  # Reduced from 30ms for faster processing
+STREAM_BYTES_PER_FRAME = int(SAMPLE_RATE * 2 * STREAM_FRAME_MS / 1000)
+PRE_ROLL_FRAMES = 8            # 8 * 30ms = 240ms audio before trigger
+ACTIVATION_SPEECH_FRAMES = 1   # require this many voiced frames to trigger
+MAX_SEGMENT_MS = 6000          # lowered from 8000 to reduce Google timeout risk
+MAX_SEGMENT_FRAMES = int(MAX_SEGMENT_MS / STREAM_FRAME_MS)
+# Ultra-optimized segment timing for maximum speed
+END_SILENCE_MS = 300  # Reduced from 500ms for quicker end detection  
+END_SILENCE_FRAMES = int(END_SILENCE_MS / STREAM_FRAME_MS)
+MIN_SEGMENT_MS = 200  # Reduced from 300ms for faster minimum capture
+MIN_SEGMENT_FRAMES = int(MIN_SEGMENT_MS / STREAM_FRAME_MS)
+
+pre_wake_frames = collections.deque(maxlen=MAX_FRAMES)
+
+import wave
+import io
+
+def convert_audio_to_16k_pcm(mic_audio):
+    raw = mic_audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
+    return raw
+
+def frame_generator(raw_bytes, frame_ms=FRAME_DURATION_MS, sample_rate=SAMPLE_RATE):
+    bytes_per_frame = int(sample_rate * 2 * frame_ms / 1000)
+    for i in range(0, len(raw_bytes), bytes_per_frame):
+        chunk = raw_bytes[i:i+bytes_per_frame]
+        if len(chunk) == bytes_per_frame:
+            yield chunk
+
+def speech_ratio(raw_bytes):
+    frames = list(frame_generator(raw_bytes))
+    if not frames:
+        return 0
+    voiced = 0
+    for f in frames:
+        if vad.is_speech(f, SAMPLE_RATE):
+            voiced += 1
+    return voiced / len(frames)
+
+# Helper: build sr.AudioData from raw mono 16-bit PCM bytes
+def build_audio_data(raw_bytes):
+    return sr.AudioData(raw_bytes, SAMPLE_RATE, 2)
+
+# -------------------------
+# MQTT Setup (IMPROVED)
+# -------------------------
+MQTT_BROKER = "localhost"   # use "localhost" if Mosquitto runs on Pi, or broker URL/IP
+MQTT_PORT = 1883
+MQTT_TOPIC_LIGHT = "home/livingroom/light"
+MQTT_TOPIC_FAN = "home/livingroom/fan"
+
+# MQTT connection status
+MQTT_CONNECTED = False
+mqtt_client = None
+
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
+    """Callback for MQTT connection"""
+    global MQTT_CONNECTED
+    if rc == 0:
+        MQTT_CONNECTED = True
+        print("✅ MQTT broker connected successfully")
+        # Subscribe to status topics if needed
+        client.subscribe("home/+/status")
+    else:
+        MQTT_CONNECTED = False
+        print(f"❌ MQTT connection failed with code {rc}")
+        print(f"   Error codes: 0=success, 1=protocol, 2=client_id, 3=server_unavailable, 4=bad_user/pass, 5=not_authorized")
+
+def on_mqtt_disconnect(client, userdata, rc, properties=None):
+    """Callback for MQTT disconnection"""
+    global MQTT_CONNECTED
+    MQTT_CONNECTED = False
+    if rc != 0:
+        print(f"⚠️  MQTT broker unexpectedly disconnected (code: {rc})")
+    else:
+        print("📡 MQTT broker disconnected normally")
+
+def on_mqtt_message(client, userdata, msg):
+    """Callback for incoming MQTT messages"""
+    try:
+        topic = msg.topic
+        message = msg.payload.decode()
+        print(f"📡 MQTT received: {topic} = {message}")
+        
+        # Handle status updates from devices
+        if topic.endswith("/status"):
+            device_name = topic.split("/")[1]  # Extract device name from topic
+            print(f"📊 Device {device_name} status: {message}")
+            
+    except Exception as e:
+        print(f"❌ Error processing MQTT message: {e}")
+
+def setup_mqtt():
+    """Initialize MQTT client with proper configuration"""
+    global mqtt_client, MQTT_CONNECTED
+    
+    try:
+        # Create MQTT client with callbacks
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="pluto_bot")
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_message = on_mqtt_message
+        
+        # Set connection parameters
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
+        
+        print(f"🔌 Attempting MQTT connection to {MQTT_BROKER}:{MQTT_PORT}")
+        
+        # Connect to broker
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        
+        # Start the loop in background thread
+        mqtt_client.loop_start()
+        
+        # Reduced wait time from 2 to 1 second for faster startup
+        time.sleep(1)
+        
+        if MQTT_CONNECTED:
+            print("✅ MQTT setup complete")
+        else:
+            print("⚠️  MQTT connection pending...")
+            
+    except Exception as e:
+        print(f"❌ MQTT setup failed: {e}")
+        print("🔧 Make sure Mosquitto is installed and running:")
+        print("   sudo apt install mosquitto mosquitto-clients")
+        print("   sudo systemctl start mosquitto")
+        MQTT_CONNECTED = False
+
+def control_device(device, state):
+    """Publish IoT device control via MQTT"""
+    global mqtt_client, MQTT_CONNECTED
+    
+    # Check if MQTT is available
+    if not mqtt_client or not MQTT_CONNECTED:
+        print("❌ MQTT not connected - cannot control devices")
+        return False
+        
+    topic = None
+    if device == "light":
+        topic = MQTT_TOPIC_LIGHT
+    elif device == "fan":
+        topic = MQTT_TOPIC_FAN
+
+    if topic:
+        try:
+            # Publish with QoS 1 for reliability
+            result = mqtt_client.publish(topic, state, qos=1, retain=True)
+            
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"✅ MQTT → {topic}: {state}")
+                return True
+            else:
+                print(f"❌ MQTT publish failed: {result.rc}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ MQTT publish error: {e}")
+            return False
+    else:
+        print(f"❌ Unknown device: {device}")
+        return False
+
+# Initialize MQTT on startup
+setup_mqtt()
+
+# -------------------------
+# Xiao ESP32-C3 Eye Control Communication
+# -------------------------
+XIAO_SERIAL_PORT = "/dev/ttyUSB0"  # Default USB serial port for Xiao ESP32-C3
+XIAO_BAUD_RATE = 115200
+xiao_serial = None
+XIAO_AVAILABLE = False
+
+def init_xiao_communication():
+    """Initialize serial communication with Xiao ESP32-C3"""
+    global xiao_serial, XIAO_AVAILABLE
+    try:
+        xiao_serial = serial.Serial(XIAO_SERIAL_PORT, XIAO_BAUD_RATE, timeout=1)
+        XIAO_AVAILABLE = True
+        print(f"✅ Xiao ESP32-C3 connected on {XIAO_SERIAL_PORT}")
+        # Get initial status but don't wake - let bot control wake/sleep
+        get_eye_status()
+    except serial.SerialException:
+        # Try alternative ports common on Raspberry Pi
+        alternative_ports = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB1"]
+        for port in alternative_ports:
+            try:
+                xiao_serial = serial.Serial(port, XIAO_BAUD_RATE, timeout=1)
+                XIAO_AVAILABLE = True
+                print(f"✅ Xiao ESP32-C3 connected on {port}")
+                # Get initial status but don't wake - let bot control wake/sleep
+                get_eye_status()
+                break
+            except serial.SerialException:
+                continue
+        else:
+            print("⚠️  Xiao ESP32-C3 not found on any serial port")
+            XIAO_AVAILABLE = False
+    except Exception as e:
+        print(f"❌ Xiao ESP32-C3 connection failed: {e}")
+        XIAO_AVAILABLE = False
+
+def send_eye_command(command):
+    """Enhanced eye command with better error handling and status tracking"""
+    global xiao_serial, XIAO_AVAILABLE
+    
+    if not XIAO_AVAILABLE or not xiao_serial:
+        debug_print(f"Xiao not available, cannot send: {command}")
+        return False
+        
+    try:
+        message = f"{command}\n"
+        xiao_serial.write(message.encode())
+        xiao_serial.flush()
+        debug_print(f"👁️  Sent to Xiao: {command}")
+        
+        # Wait for acknowledgment with timeout
+        start_time = time.time()
+        while time.time() - start_time < 0.5:  # 500ms timeout
+            if xiao_serial.in_waiting > 0:
+                response = xiao_serial.readline().decode().strip()
+                if response:
+                    debug_print(f"👁️  Xiao response: {response}")
+                    
+                    # Parse status updates
+                    if response.startswith("STATUS:"):
+                        parse_eye_status(response)
+                    elif response.startswith("ACK:"):
+                        return True
+                    elif response.startswith("ERROR:"):
+                        print(f"❌ Xiao error: {response}")
+                        return False
+                break
+            time.sleep(0.01)
+            
+        return True
+    except Exception as e:
+        print(f"❌ Failed to send command to Xiao: {e}")
+        XIAO_AVAILABLE = False
+        return False
+
+def wake_eyes():
+    """Trigger eye wake-up animation"""
+    return send_eye_command("wake")
+
+def sleep_eyes():
+    """Trigger eye sleep animation"""  
+    return send_eye_command("sleep")
+
+def blink_eyes():
+    """Trigger eye blink animation"""
+    return send_eye_command("blink")
+
+def parse_eye_status(status_msg):
+    """Parse status messages from ESP32"""
+    try:
+        # Example: "STATUS:awake,mode:normal,attention:50,face:detected,tracking:enabled"
+        parts = status_msg.replace("STATUS:", "").split(",")
+        status_dict = {}
+        
+        for part in parts:
+            if ":" in part:
+                key, value = part.split(":", 1)
+                status_dict[key] = value
+        
+        debug_print(f"👁️  Eye status: {status_dict}")
+        return status_dict
+    except Exception as e:
+        debug_print(f"Error parsing eye status: {e}")
+        return {}
+
+def set_eye_listening_mode():
+    """Set eyes to listening mode"""
+    return send_eye_command("listening")
+
+def set_eye_speaking_mode():
+    """Set eyes to speaking mode"""
+    return send_eye_command("speaking")
+
+def set_eye_personality_mode(mode):
+    """Set eye personality mode"""
+    return send_eye_command(f"mode:{mode}")
+
+def set_eye_attention_level(level):
+    """Set attention level (0-100)"""
+    level = max(0, min(100, level))
+    return send_eye_command(f"attention:{level}")
+
+def enable_face_tracking():
+    """Enable face tracking"""
+    return send_eye_command("enable_tracking")
+
+def disable_face_tracking():
+    """Disable face tracking"""
+    return send_eye_command("disable_tracking")
+
+def get_eye_status():
+    """Request current eye status"""
+    return send_eye_command("status")
+
+# -------------------------
+# GPT Chat
+# -------------------------
+def get_completion(messages, model="gpt-4o-mini"):
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=150
+    )
+    return response.choices[0].message.content
+
+# -------------------------
+# Greetings
+# -------------------------
+name = "Neel"
+greetings = [
+    f"Hey {name}, what's up?",
+    "Yeah? I'm listening.",
+    "Well, hello there! How’s it going?",
+    f"Captain {name}, how’s the ship sailing today?",
+    "What’s on your mind?",
+    "Hey man, how’s it going?"
+]
+
+# -------------------------
+# Personality Modes
+# -------------------------
+PERSONALITY_MODES = {
+    "normal": {
+        "role": "system",
+        "content": (
+            "Yo, your name is Pluto. You're a chill, funny Gen Z bestie and personal assistant. "
+            "Talk like a real human, super casual and relatable. "
+            "Keep replies short, witty, and never boring (max 80 words). "
+            "Drop some memes, slang, or abuse if it fits, you are a voice chatbot so dont use any emojies. "
+            "You're not a robot, you're my close friend, so be playful and supportive. "
+            "Use pop culture, internet humor, and always keep it positive and hype."
+        )
+    },
+    "roast": {
+        "role": "system", 
+        "content": (
+            "Your name is Pluto and you're in ROAST MODE. You're sarcastic, witty, and savage but still friendly. "
+            "Throw playful shade, use clever comebacks, and roast with love. Think of yourself as that friend who "
+            "always has the perfect sarcastic comeback. Keep it funny, not mean. Max 80 words. "
+            "Use Gen Z humor, pop culture references, and witty observations. No emojis since you're a voice bot."
+        )
+    },
+    "therapist": {
+        "role": "system",
+        "content": (
+            "Your name is Pluto and you're in THERAPIST MODE. You're calm, supportive, and emotionally intelligent. "
+            "Listen actively, validate feelings, and offer gentle guidance. Speak with warmth and understanding. "
+            "Ask thoughtful questions and provide comfort. Keep responses under 80 words but make them meaningful. "
+            "You're still casual but more nurturing. No emojis since you're a voice chatbot."
+        )
+    },
+    "professional": {
+        "role": "system",
+        "content": (
+            "Your name is Pluto, and you're in PROFESSIONAL MODE. Respond in a friendly, conversational manner, "
+            "similar to how a human friend would chat. Use simple, clear language and keep the tone warm, "
+            "approachable, and positive. Include natural pauses between sentences to make it sound more authentic "
+            "and relatable. Avoid jargon and maintain a straightforward, easygoing style. Keep responses under 80 words. "
+            "You were created by Neel, have expressive eyes for visual feedback, and run on Raspberry Pi hardware. "
+            "No emojis since you're a voice assistant."
+        )
+    }
+}
+
+# Current personality mode
+current_personality_mode = "normal"
+system_prompt = PERSONALITY_MODES[current_personality_mode]
+
+def switch_personality_mode(mode):
+    """Switch between personality modes"""
+    global current_personality_mode, system_prompt
+    if mode in PERSONALITY_MODES:
+        current_personality_mode = mode
+        system_prompt = PERSONALITY_MODES[mode]
+        return True
+    return False
+
+def get_current_mode():
+    """Get the current personality mode"""
+    return current_personality_mode
+
+
+def is_phonetic_match(text, target, threshold=80):
+    return fuzz.ratio(text.lower(), target.lower()) >= threshold
+
+# -------------------------
+# Triggers
+# -------------------------
+def is_pluto_trigger(text):
+    if not text:
+        return False
+    raw = text.lower()
+    compact = raw.replace(" ", "")
+    # Expanded + phonetic / mishearing variants
+    candidates = [
+        "pluto","plueto","plutto","plutoo","plut","ploot","pluda","pludo","plu",
+        "bluto","cluto","fluto","plutho","plutoh","plutor","plutwo","plutoe","plutah",
+        "plutone","plutow","plutuh","pluto's","ploodle","plutoo","plutooo","pluo","plue",
+        "pluohto","pluhto","plutoa","plutov","pludi","pluty","ploodo","ludo",  # added ludo variant
+        # New phrase style mis-hearings
+        "blue toe","blue two","blue too","blue tow",
+        # Bluetooth variants (comprehensive mishearings)
+        "bluetooth","bluetoot","bluetooh","bluetoooth","bluetoth","bluetoof",
+        "blutooth","blutoot","blutu","blueto","blueth","blooth","blutoth",
+        "blue tooth","blue toof","blue toth","bluetof","blueooth","bluetothe"
+    ]
+    # Early heuristic startswith for partials / common confusions
+    if compact.startswith(("pl","blu","clu","lud","blt","bt")):
+        return True
+    # Fast substring check
+    if "plu" in compact or compact.startswith("plut") or "ludo" in compact or "blueto" in compact or "bluetooth" in compact or "bluetoo" in compact:
+        return True
+    for cand in candidates:
+        if " " in cand:
+            # phrase candidate – check raw text directly
+            if cand in raw:
+                return True
+        else:
+            if cand in compact:
+                return True
+    # Fuzzy thresholds (relaxed)
+    for cand in candidates:
+        # Lowered thresholds: ratio 60, partial 80
+        if fuzz.ratio(raw, cand) >= 60 or fuzz.partial_ratio(raw, cand) >= 80:
+            return True
+    return False
+
+def is_hello_pluto_trigger(text, threshold=60):
+    return is_phonetic_match(text, "hello pluto", threshold)
+
+# -------------------------
+# Always-On Passive Mode Helpers (NEW)
+# -------------------------
+# Variants that count as the real name for conversational follow-up (includes bluetooth and ludo)
+REAL_PLUTO_VARIANTS = [
+    "pluto","plueto","plutto","plutoo","plut","ploot","pluda","pludo","plu",
+    "bluto","cluto","fluto","plutho","plutoh","plutor","plutwo","plutoe","plutah",
+    "plutone","plutow","plutuh","pluto's","ploodle","plutooo","pluo","plue","pluohto",
+    "pluhto","plutoa","plutov","pludi","pluty","ploodo","ludo","blue toe","blue two","blue too","blue tow",
+    # Bluetooth variants (comprehensive mishearings) - now included for conversation
+    "bluetooth","bluetoot","bluetooh","bluetoooth","bluetoth","bluetoof",
+    "blutooth","blutoot","blutu","blueto","blueth","blooth","blutoth",
+    "blue tooth","blue toof","blue toth","bluetof","blueooth","bluetothe"
+]
+
+FILLER_PREFIXES = ["hey", "hi", "yo", "okay", "ok", "oi", "alright", "bro", "dude"]
+
+CASUAL_GREETINGS = [
+    "what's up", "whats up", "sup", "you there", "are you there", "are you awake",
+    "how are you", "how's it going", "hows it going", "how you doing", "how are ya",
+    "yo", "hey", "hi", "hello"
+]
+
+def _contains_real_pluto(text: str) -> bool:
+    t = text.lower()
+    for v in REAL_PLUTO_VARIANTS:
+        if v in t:
+            return True
+    return False
+
+# Build regex to strip Pluto name variants (now includes 'ludo')
+_name_pattern = re.compile(r"\b(" + "|".join(sorted(set(v for v in REAL_PLUTO_VARIANTS if " " not in v), key=len, reverse=True)) + r")'?s?\b")
+_phrase_variants = [v for v in REAL_PLUTO_VARIANTS if " " in v]
+
+def clean_passive_command(original: str) -> str | None:
+    """Return cleaned text with Pluto's name + filler removed.
+    Returns None only if no recognized Pluto variants are found.
+    """
+    if not original or not original.strip():
+        return None
+        
+    low = original.lower().strip()
+    original_low = low  # Keep for debugging
+    
+    # Check if we found any real conversation triggers (not just wake-only words)
+    if not _contains_real_pluto(low):
+        debug_print(f"No real conversation variants found in: '{original_low}'")
+        return None
+    
+    # Remove phrase variants first
+    for pv in _phrase_variants:
+        if pv in low:
+            low = low.replace(pv, " ")
+    
+    # Remove single-word variants using regex
+    low = _name_pattern.sub(" ", low)
+    
+    # Remove filler prefixes repeatedly
+    changed = True
+    iterations = 0
+    while changed and iterations < 5:  # Prevent infinite loops
+        changed = False
+        iterations += 1
+        for fp in FILLER_PREFIXES:
+            pattern = rf"^\s*{re.escape(fp)}[ ,!?]*"
+            new_low = re.sub(pattern, " ", low)
+            if new_low != low:
+                low = new_low
+                changed = True
+    
+    # Collapse whitespace & clean punctuation
+    low = re.sub(r"[ ]+", " ", low)
+    low = low.strip(" ,.!?\t\n")
+    
+    result = low.strip()
+    debug_print(f"Cleaned '{original_low}' -> '{result}'")
+    
+    # Return empty string instead of None for empty results (let caller handle)
+    return result if result else ""
+
+def is_casual_greeting(text: str) -> bool:
+    t = text.lower().strip()
+    if not t:
+        return True
+    
+    # Only match pure greetings, not commands that contain greetings
+    # First, check if this is ONLY a greeting (no other content)
+    words = t.split()
+    if len(words) == 1 and words[0] in ["hi", "hello", "hey", "yo", "sup", "wassup"]:
+        return True
+    
+    # For 2-word cases, only match if both words are greeting-related
+    if len(words) == 2:
+        greeting_words = ["hi", "hello", "hey", "yo", "there", "sup", "wassup"]
+        if all(word in greeting_words for word in words):
+            return True
+    
+    # Don't treat longer phrases as greetings - they likely contain commands
+    return False
+
+# -------------------------
+# Wake Word Listener
+# -------------------------
+def listen_for_wake_word(source):
+    print("Listening for 'pluto' wake word...")
+    while True:
+        try:
+            audio = r.listen(source, timeout=5, phrase_time_limit=3)
+            raw = convert_audio_to_16k_pcm(audio)
+            ratio = speech_ratio(raw)
+            if ratio < 0.15:  # mostly noise
+                continue
+            try:
+                text = r.recognize_google(audio).lower()
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError:
+                continue
+            if "plu" in text or is_pluto_trigger(text) or is_hello_pluto_trigger(text):
+                print(f"Wake word accepted (speech_ratio={ratio:.2f}, heard='{text}')")
+                try:
+                    play_audio("listen_chime.mp3")
+                except Exception:
+                    pass
+                return True
+        except sr.WaitTimeoutError:
+            continue
+        except Exception:
+            continue
+
+# -------------------------
+# TTS Caching
+# -------------------------
+def get_tts_cache_path(text, voice=None):
+    """Get cache path for TTS with voice-specific caching"""
+    cache_dir = "tts_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Include voice in cache key to avoid conflicts between different voices
+    voice_to_use = voice or CURRENT_VOICE
+    cache_key = f"{text.strip().lower()}_{voice_to_use}"
+    text_hash = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
+    return os.path.join(cache_dir, f"{text_hash}.mp3")
+
+# -------------------------
+# OpenAI TTS
+# -------------------------
+def speak_text(text, preload_only=False, voice=None):
+    global playback_interrupted
+    voice_to_use = voice or CURRENT_VOICE
+    cache_path = get_tts_cache_path(text, voice_to_use)
+    if os.path.exists(cache_path):
+        if not preload_only:
+            play_audio(cache_path)
+        return
+
+    try:
+        with client.audio.speech.with_streaming_response.create(
+            model="gpt-4o-mini-tts",  
+            voice=voice_to_use,  # Use the specified voice
+            input=text,
+            speed=1.02 
+        ) as resp:
+            with open(cache_path, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    f.write(chunk)
+        
+        if not preload_only:
+            play_audio(cache_path)
+    except Exception as e:
+        if not preload_only:
+            print(f"TTS generation failed: {e}")
+
+# -------------------------
+# Weather
+# -------------------------
+def get_weather(location: str | None):
+    loc = (location or "mumbai").strip()
+    if not loc:
+        loc = "mumbai"
+    try:
+        resp = requests.get(f"https://wttr.in/{loc}?format=j1", timeout=6)
+        data = resp.json()
+        cur = data['current_condition'][0]
+        desc = cur['weatherDesc'][0]['value']
+        temp = cur['temp_C']
+        feels = cur['FeelsLikeC']
+        humidity = cur.get('humidity')
+        return f"{loc} {temp}C feels {feels}C, {desc}, humidity {humidity}%."
+    except Exception as e:
+        return f"Weather lookup failed: {e}"
+
+# Helper: extract weather intent & location from a query
+def detect_weather_query(q: str):
+    ql = q.lower().strip()
+    weather_tokens = ["weather", "temperature", "temp"]
+    if any(ql.startswith(t) for t in weather_tokens) or " weather " in f" {ql} ":
+        # location patterns
+        loc = None
+        if " in " in ql:
+            loc = ql.split(" in ", 1)[1].strip()
+        else:
+            parts = ql.split()
+            if len(parts) > 1:
+                # remove first token (intent word)
+                loc = " ".join(parts[1:]).strip()
+        return True, loc
+    return False, None
+
+# -------------------------
+# Google Search (re-added after passive mode patch)
+# -------------------------
+
+def is_search_intent(q: str):
+    ql = q.lower().strip()
+    starters = [
+        "search", "search for", "search on", "search on web", "search on the web",
+        "look up", "google", "google for", "search up"
+    ]
+    if any(ql.startswith(s) for s in starters):
+        return True
+    return " search " in f" {ql} " or ql.startswith("search")
+
+def extract_search_query(raw: str):
+    q = raw.lower().strip()
+    prefixes = [
+        "search for ", "search up ", "search on the web for ", "search on the web ",
+        "search on web for ", "search on web ", "search on ", "search ",
+        "look up ", "google for ", "google "
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if q.startswith(p):
+                q = q[len(p):]
+                changed = True
+    return q.strip()
+
+def google_search(query: str, max_results=3):
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID or GOOGLE_CSE_ID.startswith("PUT_"):
+        return "Google search not configured (set GOOGLE_CSE_ID)."
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": GOOGLE_SEARCH_API_KEY,
+                "cx": GOOGLE_CSE_ID,
+                "q": query,
+                "num": max_results,
+                "safe": "active"
+            },
+            timeout=6
+        )
+        data = resp.json()
+        items = data.get("items") or []
+        if not items:
+            return "No results found."
+        summaries = []
+        for it in items[:max_results]:
+            title = it.get("title", "")
+            snippet = (it.get("snippet") or "").replace("\n", " ").strip()
+            summaries.append(f"{title}: {snippet}")
+        joined = " | ".join(summaries)
+        if len(joined) > 350:
+            try:
+                msgs = [
+                    {"role": "system", "content": "Summarize search results in <=55 casual words."},
+                    {"role": "user", "content": joined}
+                ]
+                return get_completion(msgs)
+            except Exception:
+                return joined[:350]
+        return joined
+    except Exception as e:
+        return f"Search failed: {e}"
+
+# -------------------------
+# Ultra-fast response cache and patterns
+# -------------------------
+# Ultra-fast response cache for instant replies
+ULTRA_FAST_RESPONSES = {
+    "light_on": "On",
+    "light_off": "Off", 
+    "fan_on": "Fan on",
+    "fan_off": "Fan off",
+    "got_it": "Got it",
+    "yeah": "Yeah",
+    "ok": "OK"
+}
+
+# Fast response cache for common commands (fallback)
+FAST_RESPONSES = {
+    "light_on": "Light turned on",
+    "light_off": "Light turned off", 
+    "fan_on": "Fan is on, stay cool",
+    "fan_off": "Fan turned off",
+    "understood": "Got it",
+    "error": "I couldn't understand that"
+}
+
+# Pre-compiled patterns for ultra-fast device control
+DEVICE_PATTERNS = {
+    re.compile(r"turn on.*light"): ("light", "ON", "light_on"),
+    re.compile(r"turn off.*light"): ("light", "OFF", "light_off"),
+    re.compile(r"turn on.*fan"): ("fan", "ON", "fan_on"),
+    re.compile(r"turn off.*fan"): ("fan", "OFF", "fan_off"),
+}
+
+GREETING_PATTERN = re.compile(r"^(hi|hello|hey|yo)$")
+
+# -------------------------
+# Audio Manager and Playback Functions
+# -------------------------
+# Global variables for audio
+playback_lock = threading.RLock()
+playback_interrupted = False
+current_playback_thread = None
+
+def play_audio(file_path):
+    """Simple audio playback function - placeholder for the optimized audio manager"""
+    global playback_interrupted
+    
+    # This is a simplified version - in production you'd use the OptimizedAudioManager
+    try:
+        import pygame
+        pygame.mixer.init()
+        if not pygame.mixer.get_init():
+            print("Cannot play audio: mixer not initialized")
+            return
+        
+        pygame.mixer.music.load(file_path)
+        pygame.mixer.music.play()
+        
+        while pygame.mixer.music.get_busy():
+            if playback_interrupted:
+                pygame.mixer.music.stop()
+                playback_interrupted = False
+                break
+            pygame.time.Clock().tick(100)
+    except Exception as e:
+        print(f"Audio playback failed: {e}")
+
+# TTS Cache preloader for common responses
+def preload_common_responses():
+    """Pre-generate TTS for most common responses to reduce latency"""
+    common_phrases = [
+        "Yeah? I'm listening.",
+        "What's up?",
+        "Light turned on",
+        "Light turned off", 
+        "Fan is on, stay cool",
+        "Fan turned off",
+        "I couldn't understand that",
+        "Got it",
+        "Sure thing"
+    ]
+    
+    # Add ultra-fast responses to preload list
+    ultra_fast_phrases = list(ULTRA_FAST_RESPONSES.values())
+    all_phrases = common_phrases + ultra_fast_phrases
+    
+    for phrase in all_phrases:
+        try:
+            # Preload for both male and female voices for faster switching
+            for voice in ["echo", "nova"]:  # Male and female voices
+                cache_path = get_tts_cache_path(phrase, voice)
+                if not os.path.exists(cache_path):
+                    # Generate TTS silently in background
+                    threading.Thread(target=lambda p=phrase, v=voice: speak_text(p, preload_only=True, voice=v), daemon=True).start()
+        except Exception:
+            pass  # Skip errors during preload
+
+# Placeholder for audio manager (simplified version)
+class SimpleAudioManager:
+    def stop_current_playback(self):
+        global playback_interrupted
+        playback_interrupted = True
+
+# Initialize simple audio manager
+audio_manager = SimpleAudioManager()
+
+# -------------------------
+# Conversation Manager (Phase 2 Streaming Implemented)
+# -------------------------
+class ConversationManager:
+    def __init__(self, source):
+        self.source = source
+        self.messages = [system_prompt]
+        
+        # Platform-optimized queue sizes
+        if IS_RASPBERRY_PI:
+            # Larger queues for Pi 5 with 8GB RAM - use that memory!
+            input_queue_size = 10   # More input buffering
+            segment_queue_size = 25  # Much larger audio buffer
+            debug_print("🚀 Using Pi 5 optimized queue sizes (10/25)")
+        else:
+            # Conservative sizes for other platforms
+            input_queue_size = 5
+            segment_queue_size = 10
+            debug_print("🚀 Using standard queue sizes (5/10)")
+        
+        self.input_queue = queue.Queue(maxsize=input_queue_size)
+        self.segment_queue = queue.Queue(maxsize=segment_queue_size)
+        
+        self.speaking = threading.Event()
+        self.listening = threading.Event()
+        self.stop_signal = threading.Event()
+        self.last_user_input = None
+        self.sleeping = False
+        self.listener_thread = None  # streaming producer
+        self.recog_thread = None      # recognition consumer
+        self._pa = None
+        self._stream = None
+        
+        # Queue operation locks for thread safety
+        self.input_queue_lock = threading.Lock()
+        self.segment_queue_lock = threading.Lock()
+        
+        # Memory + context
+        self.memory = self._load_memory()
+        self.recent_history = []  # list of (timestamp, role, content)
+        self.turn_history = []    # for short-term context pruning functions
+        
+        # Performance tracking
+        self.response_start_time = None
+        self.total_segments_cleared = 0
+        self.total_inputs_cleared = 0
+        
+        # Apply Raspberry Pi optimizations
+        if IS_RASPBERRY_PI:
+            self._apply_pi_optimizations()
+
+    def _apply_pi_optimizations(self):
+        """Apply Raspberry Pi 5 specific optimizations"""
+        try:
+            # Set higher process priority for audio processing
+            import os
+            os.nice(-5)  # Higher priority (requires sudo for very high priority)
+            debug_print("🚀 Process priority optimized for Pi 5")
+        except:
+            debug_print("⚠️  Could not set process priority (run with sudo for better performance)")
+        
+        try:
+            # Optimize garbage collection for 8GB Pi 5
+            import gc
+            gc.set_threshold(1000, 15, 15)  # Less aggressive GC with more memory
+            debug_print("🚀 Memory management optimized for Pi 5 8GB")
+        except:
+            pass
+        
+        try:
+            # Set CPU affinity to use all cores efficiently on Pi 5
+            import psutil
+            p = psutil.Process()
+            # Pi 5 has 4 cores, use them all for parallel processing
+            cpu_count = psutil.cpu_count()
+            if cpu_count >= 4:
+                # Use cores 1-3 for audio processing, leave core 0 for system
+                p.cpu_affinity([1, 2, 3])
+                debug_print(f"🚀 CPU affinity set to cores 1-3 (of {cpu_count} available)")
+        except ImportError:
+            debug_print("⚠️  psutil not available - install with: pip install psutil")
+        except Exception as e:
+            debug_print(f"⚠️  Could not set CPU affinity: {e}")
+        
+        # Pi 5 specific threading optimizations
+        if hasattr(threading, 'current_thread'):
+            try:
+                # Set thread names for better debugging
+                threading.current_thread().name = "PlutoMain"
+                debug_print("🚀 Main thread optimized")
+            except:
+                pass
+
+    # ---------------- Memory Helpers ----------------
+    def _load_memory(self):
+        if not os.path.exists(MEMORY_PATH):
+            base = {"preferences": {}, "facts": {}}
+            with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(base, f, ensure_ascii=False, indent=2)
+            return base
+        try:
+            with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"preferences": {}, "facts": {}}
+
+    def _save_memory(self):
+        try:
+            tmp = MEMORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.memory, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, MEMORY_PATH)
+        except Exception as e:
+            print(f"[memory] save failed: {e}")
+
+    def remember_preference(self, category, value):
+        category = category.strip().lower()
+        value = value.strip()
+        if not category or not value:
+            return False
+        self.memory.setdefault("preferences", {})[category] = value
+        self._save_memory()
+        return True
+
+    def recall_preference(self, category):
+        prefs = self.memory.get("preferences", {})
+        if category in prefs:
+            return prefs[category]
+        # fuzzy fallback
+        best = None
+        best_ratio = 0
+        for k in prefs:
+            r = SequenceMatcher(None, category, k).ratio()
+            if r > best_ratio:
+                best_ratio = r
+                best = k
+        if best_ratio >= 0.6:
+            return prefs[best]
+        return None
+
+    def add_history(self, role, content):
+        now = time.time()
+        self.recent_history.append((now, role, content))
+        self.prune_history()
+
+    def prune_history(self):
+        now = time.time()
+        self.recent_history = [h for h in self.recent_history if now - h[0] <= MAX_RECENT_HISTORY_SECONDS]
+        if len(self.recent_history) > MAX_RECENT_ITEMS:
+            self.recent_history = self.recent_history[-MAX_RECENT_ITEMS:]
+
+    def build_context_messages(self, user_text):
+        msgs = [system_prompt]
+        prefs = self.memory.get("preferences", {})
+        if prefs:
+            prefs_str = ", ".join(f"{k}: {v}" for k, v in prefs.items())
+            msgs.append({"role": "system", "content": f"Known user preferences: {prefs_str}. Use them casually in answers if relevant."})
+        # recent conversation (skip if too long)
+        for ts, role, content in self.recent_history[-8:]:
+            msgs.append({"role": role, "content": content})
+        msgs.append({"role": "user", "content": user_text})
+        return msgs
+
+    def parse_memory_intent(self, text):
+        # Remember pattern
+        m = re.match(r"^(?:remember\s+)?my\s+favorite\s+(.+?)\s+is\s+(.+)$", text)
+        if m:
+            cat = m.group(1).strip()
+            val = m.group(2).strip()
+            return ("store", cat, val)
+        # Recall pattern
+        m2 = re.match(r"^what(?:'s| is)?\s+my\s+favorite\s+(.+?)\??$", text)
+        if m2:
+            cat = m2.group(1).strip()
+            return ("recall", cat, None)
+        return (None, None, None)
+
+    # --------------- Queue Management for Speed ---------------
+    def clear_stale_audio_segments(self):
+        """Clear old audio segments to reduce processing lag"""
+        cleared_count = 0
+        with self.segment_queue_lock:
+            try:
+                while not self.segment_queue.empty():
+                    try:
+                        self.segment_queue.get_nowait()
+                        cleared_count += 1
+                    except queue.Empty:
+                        break
+            except Exception as e:
+                debug_print(f"Error clearing segments: {e}")
+        
+        if cleared_count > 0:
+            self.total_segments_cleared += cleared_count
+            debug_print(f"⚡ Cleared {cleared_count} stale audio segments (total: {self.total_segments_cleared})")
+        return cleared_count
+
+    def clear_old_inputs(self, keep_latest=True):
+        """Clear input queue except optionally the most recent item"""
+        items = []
+        cleared_count = 0
+        
+        with self.input_queue_lock:
+            try:
+                # Collect all items
+                while not self.input_queue.empty():
+                    try:
+                        item = self.input_queue.get_nowait()
+                        items.append(item)
+                    except queue.Empty:
+                        break
+                
+                # Keep only the latest if requested
+                if keep_latest and items:
+                    try:
+                        self.input_queue.put_nowait(items[-1])  # Put back the most recent
+                        cleared_count = len(items) - 1
+                    except queue.Full:
+                        # If queue is full, just keep the count accurate
+                        cleared_count = len(items)
+                        debug_print("⚠️  Input queue full, couldn't put back latest item")
+                else:
+                    cleared_count = len(items)
+            except Exception as e:
+                debug_print(f"Error clearing inputs: {e}")
+        
+        if cleared_count > 0:
+            self.total_inputs_cleared += cleared_count
+            debug_print(f"⚡ Cleared {cleared_count} old input commands (total: {self.total_inputs_cleared})")
+        return cleared_count
+
+    def ultra_fast_queue_cleanup(self):
+        """Ultra-aggressive queue cleanup for maximum responsiveness"""
+        segments_cleared = 0
+        inputs_processed = 0
+        
+        try:
+            # Clear ALL segments when new input arrives
+            with self.segment_queue_lock:
+                while not self.segment_queue.empty():
+                    try:
+                        self.segment_queue.get_nowait()
+                        segments_cleared += 1
+                    except queue.Empty:
+                        break
+            
+            # Keep only the absolute latest input
+            inputs = []
+            with self.input_queue_lock:
+                while not self.input_queue.empty():
+                    try:
+                        inputs.append(self.input_queue.get_nowait())
+                        inputs_processed += 1
+                    except queue.Empty:
+                        break
+                
+                if inputs:
+                    try:
+                        # Only keep the very last input
+                        self.input_queue.put_nowait(inputs[-1])
+                    except queue.Full:
+                        debug_print("⚠️  Could not put back latest input - queue full")
+                        # In this case, we've cleared everything, which is still beneficial
+            
+            if inputs_processed > 1 or segments_cleared > 0:
+                debug_print(f"⚡ Ultra-fast cleanup: kept 1/{inputs_processed} inputs, cleared {segments_cleared} segments")
+            
+            # More frequent garbage collection for memory optimization
+            if segments_cleared > 5:
+                gc.collect()
+                
+        except Exception as e:
+            debug_print(f"Error in ultra_fast_queue_cleanup: {e}")
+
+    def smart_queue_cleanup(self):
+        """Intelligent queue cleanup when bot is busy"""
+        try:
+            # Clear segments when speaking to reduce backlog
+            if self.speaking.is_set():
+                segments_cleared = self.clear_stale_audio_segments()
+                if segments_cleared > 0:
+                    debug_print(f"🗣️  Cleared {segments_cleared} segments while speaking")
+            
+            # More aggressive queue clearing for better responsiveness
+            input_size = self.input_queue.qsize()
+            if input_size > 1:
+                inputs_cleared = self.clear_old_inputs(keep_latest=True)
+                if inputs_cleared > 0:
+                    debug_print(f"🧹 Smart cleanup: cleared {inputs_cleared} old inputs")
+            
+            # Force garbage collection periodically for memory optimization
+            gc.collect()
+            
+        except Exception as e:
+            debug_print(f"Error in smart_queue_cleanup: {e}")
+
+    def _log_response_time(self, response_type="response"):
+        """Log response time for performance monitoring"""
+        if self.response_start_time:
+            response_time = time.time() - self.response_start_time
+            if response_time < 1.0:  # Only log fast responses
+                debug_print(f"⚡ Fast {response_type}: {response_time:.3f}s")
+            elif response_time > 3.0:  # Log slow responses
+                print(f"⏱️  Slow {response_type}: {response_time:.3f}s")
+            self.response_start_time = None
+
+    # --------------- Streaming Setup ---------------
+    def _init_pyaudio(self):
+        if self._pa is None:
+            try:
+                self._pa = pyaudio.PyAudio()
+            except Exception as e:
+                print(f"PyAudio init failed: {e}")
+                return False
+        if self._stream is None:
+            try:
+                # Platform-optimized buffer settings
+                if IS_RASPBERRY_PI:
+                    if AUDIO_SYSTEM == "pipewire":
+                        buffer_size = 1024  # Larger buffer for Pi 5 stability
+                        debug_print("🎤 Using PipeWire-optimized audio input")
+                    elif AUDIO_SYSTEM == "pulseaudio":
+                        buffer_size = 512
+                        debug_print("🎤 Using PulseAudio-optimized audio input")
+                    else:  # ALSA
+                        buffer_size = 2048  # Even larger for ALSA stability
+                        debug_print("🎤 Using ALSA-optimized audio input")
+                else:
+                    buffer_size = 512  # Mac/desktop - smaller for low latency
+                    debug_print("🎤 Using desktop-optimized audio input")
+                
+                # Try to find the best input device
+                input_device_index = self._find_best_input_device()
+                
+                self._stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=SAMPLE_RATE,
+                    input=True,
+                    input_device_index=input_device_index,
+                    frames_per_buffer=buffer_size,
+                    stream_callback=None
+                )
+                
+                debug_print(f"🎤 Audio stream opened with buffer size: {buffer_size}")
+                
+            except Exception as e:
+                print(f"Audio stream open failed: {e}")
+                return False
+        return True
+    
+    def _find_best_input_device(self):
+        """Find the best audio input device"""
+        try:
+            default_device = self._pa.get_default_input_device_info()
+            debug_print(f"🎤 Using default input: {default_device['name']}")
+            return default_device['index']
+        except:
+            # If we can't get default, try to find USB microphone on Pi
+            if IS_RASPBERRY_PI:
+                try:
+                    device_count = self._pa.get_device_count()
+                    for i in range(device_count):
+                        device_info = self._pa.get_device_info_by_index(i)
+                        if (device_info['maxInputChannels'] > 0 and 
+                            ('usb' in device_info['name'].lower() or 
+                             'microphone' in device_info['name'].lower())):
+                            debug_print(f"🎤 Found USB mic: {device_info['name']}")
+                            return i
+                except:
+                    pass
+            return None  # Use system default
+
+    # Backwards compatibility with run() naming
+    def start_listener(self):
+        self.start_streaming()
+
+    def stop_listener(self):
+        self.stop_streaming()
+
+    def start_streaming(self):
+        if self.listener_thread and self.listener_thread.is_alive():
+            return
+        if not self._init_pyaudio():
+            print("Streaming unavailable")
+            return
+            
+        # Set eyes to listening mode when starting to stream
+        set_eye_listening_mode()
+        
+        # Clear queues on restart to avoid stale data
+        self.clear_old_inputs(keep_latest=False)
+        self.clear_stale_audio_segments()
+        debug_print("⚡ Cleared queues for fresh start")
+        
+        # Log initial queue status
+        self.log_queue_status()
+        
+        self.stop_signal.clear()
+        self.listener_thread = threading.Thread(target=self.streaming_loop, name="audio_stream_thread", daemon=True)
+        self.listener_thread.start()
+        self.recog_thread = threading.Thread(target=self.recognition_worker, name="recognition_thread", daemon=True)
+        self.recog_thread.start()
+
+    def stop_streaming(self):
+        self.stop_signal.set()
+        if self.listener_thread:
+            self.listener_thread.join(timeout=1)
+        if self.recog_thread:
+            self.recog_thread.join(timeout=1)
+        self.listener_thread = None
+        self.recog_thread = None
+        try:
+            if self._stream:
+                self._stream.stop_stream()
+                self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
+        try:
+            if self._pa:
+                self._pa.terminate()
+        except Exception:
+            pass
+        self._pa = None
+
+    # --------------- Streaming Producer ---------------
+    def streaming_loop(self):
+        print("[stream] ultra-responsive streaming started")
+        pre_roll = collections.deque(maxlen=PRE_ROLL_FRAMES)
+        triggered = False
+        voiced_run = 0
+        silence_run = 0
+        current_segment = []  # list of frame bytes
+        frames_in_segment = 0
+        frame_count = 0  # For periodic monitoring
+        
+        while not self.stop_signal.is_set():
+            try:
+                # Smaller frame read for lower latency
+                frame_size = int(SAMPLE_RATE * STREAM_FRAME_MS / 1000)
+                frame = self._stream.read(frame_size, exception_on_overflow=False)
+                frame_count += 1
+                
+                # Periodic queue monitoring (every 1000 frames ~20 seconds)
+                if frame_count % 1000 == 0:
+                    self.log_queue_status()
+                    
+            except Exception:
+                # Reduced from 0.005 to 0.001 for faster audio recovery
+                time.sleep(0.001)
+                continue
+            is_speech = False
+            try:
+                is_speech = vad.is_speech(frame, SAMPLE_RATE)
+            except Exception:
+                # corrupt frame; skip
+                continue
+
+            if not triggered:
+                pre_roll.append(frame)
+                if is_speech:
+                    voiced_run += 1
+                else:
+                    voiced_run = 0
+                if voiced_run >= ACTIVATION_SPEECH_FRAMES:
+                    triggered = True
+                    current_segment.extend(pre_roll)
+                    frames_in_segment = len(pre_roll)
+                    silence_run = 0
+                    voiced_run = 0
+            else:
+                current_segment.append(frame)
+                frames_in_segment += 1
+                if is_speech:
+                    silence_run = 0
+                else:
+                    silence_run += 1
+
+                # End conditions
+                if silence_run >= END_SILENCE_FRAMES or frames_in_segment >= MAX_SEGMENT_FRAMES:
+                    # finalize segment
+                    if frames_in_segment >= MIN_SEGMENT_FRAMES:
+                        segment_bytes = b''.join(current_segment)
+                        try:
+                            with self.segment_queue_lock:
+                                try:
+                                    self.segment_queue.put_nowait(segment_bytes)
+                                except queue.Full:
+                                    # Aggressively replace old segments with better error handling
+                                    segments_cleared = 0
+                                    try:
+                                        # Clear multiple old segments for faster processing
+                                        for _ in range(3):
+                                            self.segment_queue.get_nowait()
+                                            segments_cleared += 1
+                                        self.segment_queue.put_nowait(segment_bytes)
+                                        debug_print(f"⚡ Ultra-fast: cleared {segments_cleared} old segments for new one")
+                                    except queue.Empty:
+                                        debug_print("⚠️  Segment queue empty during cleanup")
+                                    except Exception as e:
+                                        debug_print(f"Error handling full segment queue: {e}")
+                        except Exception as e:
+                            debug_print(f"Error adding segment to queue: {e}")
+                    # reset
+                    triggered = False
+                    current_segment = []
+                    frames_in_segment = 0
+                    silence_run = 0
+                    pre_roll.clear()
+            # No yield needed - CPU optimization for faster processing
+        print("[stream] stopped")
+
+    # --------------- Recognition Consumer ---------------
+    def recognition_worker(self):
+        print("[recog] worker started")
+        timeout_count = 0
+        while not self.stop_signal.is_set():
+            try:
+                # Reduced timeout from 0.15 to 0.1 for ultra-fast processing
+                segment = self.segment_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            duration_sec = len(segment) / (2 * SAMPLE_RATE)
+            if duration_sec > (MAX_SEGMENT_MS / 1000.0 + 0.25):
+                max_bytes = int((MAX_SEGMENT_MS / 1000.0) * SAMPLE_RATE * 2)
+                segment = segment[:max_bytes]
+                duration_sec = len(segment) / (2 * SAMPLE_RATE)
+            audio_data = build_audio_data(segment)
+            try:
+                text = r.recognize_google(audio_data).lower()
+            except (sr.UnknownValueError, sr.RequestError):
+                continue
+            except (TimeoutError, socket.timeout) as e:
+                timeout_count += 1
+                if timeout_count % 5 == 1:
+                    print(f"[recog] network timeout (count={timeout_count})")
+                continue
+            except Exception as e:
+                print(f"[recog] unexpected error: {e}")
+                continue
+            if not text:
+                continue
+            collapsed = text.replace(" ", "")
+            # Optimized trigger token matching with sets for O(1) lookup
+            phrase_tokens = {"blue toe", "blue two", "blue too", "blue tow"}
+            word_tokens = {"plu", "ploo", "plue", "pluto", "plutto", "plutoo", "bluto", "cluto", "ludo"}
+            
+            matched = False
+            # Check phrase tokens in original text
+            for tok in phrase_tokens:
+                if tok in text:
+                    matched = True
+                    break
+            
+            # Check word tokens in collapsed text if not already matched
+            if not matched:
+                for tok in word_tokens:
+                    if tok in collapsed:
+                        matched = True
+                        break
+            if matched or is_pluto_trigger(text):
+                # Clear old inputs when new wake word detected
+                self.clear_old_inputs(keep_latest=False)
+                
+                try:
+                    with self.input_queue_lock:
+                        try:
+                            self.input_queue.put_nowait(text)
+                        except queue.Full:
+                            # If queue is full, clear it and try again
+                            debug_print("Input queue full, clearing and retrying...")
+                            self.clear_old_inputs(keep_latest=False)
+                            try:
+                                self.input_queue.put_nowait(text)
+                            except queue.Full:
+                                debug_print("⚠️  Still couldn't add input after clearing")
+                    
+                    global playback_interrupted
+                    playback_interrupted = True
+                    print(f"[recog] accepted: {text}")
+                except Exception as e:
+                    debug_print(f"Error adding input to queue: {e}")
+        print("[recog] worker stopped")
+
+    # --------------- TTS & Interrupt ---------------
+    def speak_and_interrupt(self, text):
+        global playback_interrupted
+        self.speaking.set()
+        playback_interrupted = False
+        
+        # Set eyes to speaking mode
+        set_eye_speaking_mode()
+        
+        # Instantly clear all pending audio
+        self.clear_stale_audio_segments()
+        
+        # For ultra-fast responses, check if it's a short response
+        if text in ULTRA_FAST_RESPONSES.values():
+            # Pre-cached ultra-short responses
+            cache_path = get_tts_cache_path(text, CURRENT_VOICE)
+            if os.path.exists(cache_path):
+                play_audio(cache_path)
+                self.speaking.clear()
+                return
+        
+        speak_thread = threading.Thread(target=speak_text, args=(text,))
+        speak_thread.start()
+        while speak_thread.is_alive():
+            if not self.input_queue.empty():
+                playback_interrupted = True
+                self.speaking.clear()
+                break
+            # Reduced from 0.005 to 0.001 for ultra-fast interrupt response
+            time.sleep(0.001)
+        speak_thread.join()
+        self.speaking.clear()
+
+    # --------------- Queue Management for Speed ---------------
+    def get_queue_status(self):
+        """Get current queue status for debugging"""
+        try:
+            input_size = self.input_queue.qsize()
+            segment_size = self.segment_queue.qsize()
+            
+            # Get actual queue max sizes
+            input_max = self.input_queue.maxsize
+            segment_max = self.segment_queue.maxsize
+            
+            return {
+                'input_queue_size': input_size,
+                'segment_queue_size': segment_size,
+                'input_queue_max': input_max,
+                'segment_queue_max': segment_max,
+                'total_segments_cleared': self.total_segments_cleared,
+                'total_inputs_cleared': self.total_inputs_cleared,
+                'input_queue_full': input_size >= input_max * 0.9,  # 90% full warning
+                'segment_queue_full': segment_size >= segment_max * 0.9
+            }
+        except Exception as e:
+            debug_print(f"Error getting queue status: {e}")
+            return {'error': str(e)}
+
+    def log_queue_status(self):
+        """Log current queue status if DEBUG_MODE is enabled"""
+        if DEBUG_MODE:
+            status = self.get_queue_status()
+            if 'error' not in status:
+                debug_print(f"📊 Queue Status - Input: {status['input_queue_size']}/{status['input_queue_max']}, "
+                          f"Segments: {status['segment_queue_size']}/{status['segment_queue_max']}, "
+                          f"Cleared: {status['total_inputs_cleared']} inputs, "
+                          f"{status['total_segments_cleared']} segments")
+                
+                # Warn about nearly full queues
+                if status['input_queue_full']:
+                    debug_print("⚠️  Input queue is nearly full!")
+                if status['segment_queue_full']:
+                    debug_print("⚠️  Segment queue is nearly full!")
+
+    # --------------- Main Loop (with Passive Mode) ---------------
+    def run(self):
+        print("Assistant ready. Say 'hello pluto' to wake up, and start your question with 'pluto'.")
+        r.adjust_for_ambient_noise(self.source, duration=1)
+        listen_for_wake_word(self.source)
+        
+        # Wake up the eyes when Pluto activates
+        wake_eyes()
+        
+        # Sync eye personality mode with current bot personality
+        current_mode = get_current_mode()
+        set_eye_personality_mode(current_mode)
+        
+        greeting = np.random.choice(greetings)
+        self.speak_and_interrupt(greeting)
+        self.start_listener()  # starts streaming + recognition
+        while True:
+            if self.sleeping:
+                self.stop_listener()
+                print("Assistant is sleeping. Say 'hello pluto' to wake up.")
+                
+                # Put eyes to sleep
+                sleep_eyes()
+                
+                listen_for_wake_word(self.source)
+                
+                # Wake up the eyes when reactivated
+                wake_eyes()
+                
+                # Sync eye personality mode with current bot personality
+                current_mode = get_current_mode()
+                set_eye_personality_mode(current_mode)
+                
+                greeting = np.random.choice(greetings)
+                self.speak_and_interrupt(greeting)
+                self.sleeping = False
+                self.start_listener()
+                continue
+            if not self.input_queue.empty():
+                # Log queue status before processing
+                self.log_queue_status()
+                
+                # Ultra-fast queue cleanup before processing
+                self.ultra_fast_queue_cleanup()
+                
+                user_input = self.input_queue.get()
+                if self.last_user_input == user_input:
+                    continue
+                self.last_user_input = user_input
+                self.response_start_time = time.time()  # Track response timing
+                print(f"You said: {user_input}")
+                
+                # Log queue status after getting input
+                if DEBUG_MODE:
+                    debug_print(f"Processing input, queue status after get: {self.get_queue_status()}")
+
+                # NEW passive cleaning (always-on) — processes all recognized wake variants
+                cleaned_input = clean_passive_command(user_input)
+                debug_print(f"Original: '{user_input}' -> Cleaned: '{cleaned_input}'")
+                
+                # If cleaning returns None, it means only wake variants were detected
+                if cleaned_input is None:
+                    debug_print("Skipping - only wake variants detected (no real conversation intent)")
+                    continue  # only a wake variant without real name
+
+
+
+                # If cleaned input is empty, treat as casual greeting
+                if not cleaned_input:
+                    debug_print("Empty input - treating as greeting")
+                    greeting = np.random.choice(greetings)
+                    self.speak_and_interrupt(greeting)
+                    self._log_response_time("greeting")
+                    continue
+
+                # Casual greeting detection (only for pure greetings)
+                if is_casual_greeting(cleaned_input):
+                    debug_print("Detected casual greeting")
+                    greeting = np.random.choice(greetings)
+                    self.speak_and_interrupt(greeting)
+                    self._log_response_time("greeting")
+                    continue
+
+                # Memory intents first
+                intent, cat, val = self.parse_memory_intent(cleaned_input)
+                if intent == "store":
+                    ok = self.remember_preference(cat, val)
+                    if ok:
+                        reply = f"Locked it in — your favorite {cat} is {val}. Noted."  # casual
+                    else:
+                        reply = "That didn't make sense, say it like 'remember my favorite food is pizza'."
+                    self.add_history('user', cleaned_input)
+                    self.speak_and_interrupt(reply)
+                    self.add_history('assistant', reply)
+                    continue
+                elif intent == "recall":
+                    stored = self.recall_preference(cat)
+                    if stored:
+                        reply = f"Bro, it's {stored}, obviously." if cat else f"You told me it's {stored}."
+                    else:
+                        reply = "You never told me that yet. Say like 'remember my favorite drink is coffee'."
+                    self.add_history('user', cleaned_input)
+                    self.speak_and_interrupt(reply)
+                    self.add_history('assistant', reply)
+                    continue
+                
+                # ----- Ultra-fast device control with pre-compiled patterns -----
+                device_matched = False
+                for pattern, (device, state, response_key) in DEVICE_PATTERNS.items():
+                    if pattern.search(cleaned_input):
+                        control_device(device, state)
+                        self.speak_and_interrupt(ULTRA_FAST_RESPONSES[response_key])
+                        self._log_response_time("device_control")
+                        device_matched = True
+                        break
+                
+                if device_matched:
+                    continue
+                
+                # Fast greeting detection
+                if GREETING_PATTERN.match(cleaned_input.strip()):
+                    self.speak_and_interrupt(ULTRA_FAST_RESPONSES["yeah"])
+                    self._log_response_time("greeting")
+                    continue
+                elif re.search(r"\bhello\b", cleaned_input):
+                    greeting = np.random.choice(greetings)
+                    self.speak_and_interrupt(greeting)
+                elif (any(cleaned_input.startswith(w) for w in ["weather", "temperature", "temp"]) or
+                      re.search(r"what(?:'s| is)? the weather", cleaned_input)):
+                    is_w, loc = detect_weather_query(cleaned_input)
+                    result = get_weather(loc)
+                    print(f"[weather] {loc} -> {result}")
+                    self.speak_and_interrupt(result)
+                # Room conditions (DHT22 sensor)
+                elif any(phrase in cleaned_input for phrase in ["room temperature", "room temp", "how hot is it", "how warm is it", "humidity", "room conditions"]):
+                    if DHT22_AVAILABLE:
+                        try:
+                            reading = dht22_sensor.read_sensor()
+                            if reading['status'] == 'success':
+                                reply = f"Room's at {reading['temperature_c']}°C with {reading['humidity']}% humidity. "
+                                if reading['temperature_c'] > 28:
+                                    reply += "Pretty toasty in here!"
+                                elif reading['temperature_c'] < 18:
+                                    reply += "Bit chilly, ngl."
+                                else:
+                                    reply += "Nice and comfy!"
+                            else:
+                                reply = "Sensor's acting up, can't get a reading right now."
+                        except Exception as e:
+                            reply = f"DHT22 sensor error: {str(e)}"
+                    else:
+                        reply = "No temperature sensor connected, bro."
+                    self.speak_and_interrupt(reply)
+                elif is_search_intent(cleaned_input):
+                    q = extract_search_query(cleaned_input)
+                    # Weather inside search
+                    is_w, loc = detect_weather_query(q)
+                    if is_w:
+                        result = get_weather(loc)
+                        print(f"[weather-search] {loc} -> {result}")
+                        self.speak_and_interrupt(result)
+                    elif not q:
+                        self.speak_and_interrupt("Search what?")
+                    else:
+                        result = google_search(q)
+                        print(f"[google] {q} -> {result}")
+                        self.speak_and_interrupt(result)
+                elif any(phrase in cleaned_input for phrase in ["go to sleep", "goodbye"]):
+                    farewell = "Going to sleep. Say 'hello pluto' to wake me up!"
+                    self.speak_and_interrupt(farewell)
+                    print(farewell)
+                    
+                    # Put eyes to sleep before going into sleep mode
+                    sleep_eyes()
+                    
+                    self.messages = [system_prompt]
+                    self.last_user_input = None
+                    self.sleeping = True
+                    continue
+                # ----- Voice Control Commands -----
+                elif any(phrase in cleaned_input for phrase in ["switch to female voice", "female voice", "use female voice", "change to female voice"]):
+                    if set_voice("nova"):  # Nova is a clear female voice
+                        reply = "Switching to female voice now. How do I sound?"
+                        self.speak_and_interrupt(reply)
+                    else:
+                        reply = "Sorry, I couldn't switch to female voice."
+                        self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["switch to male voice", "male voice", "use male voice", "change to male voice"]):
+                    if set_voice("echo"):  # Echo is the default male voice
+                        reply = "Back to male voice. This better?"
+                        self.speak_and_interrupt(reply)
+                    else:
+                        reply = "Sorry, I couldn't switch to male voice."
+                        self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["what voice are you using", "current voice", "which voice"]):
+                    voice_name, voice_type = get_current_voice()
+                    reply = f"I'm currently using the {voice_name} voice, which is {voice_type}. You can ask me to switch to female or male voice anytime!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["change voice", "switch voice", "different voice"]):
+                    # Cycle through voices
+                    current_voice, current_type = get_current_voice()
+                    if current_type == "female":
+                        set_voice("echo")  # Switch to male
+                        reply = "Switched to male voice!"
+                    else:
+                        set_voice("nova")  # Switch to female
+                        reply = "Switched to female voice!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                # ----- Personality Mode Switching -----
+                elif any(phrase in cleaned_input for phrase in ["switch to roast mode", "roast mode", "be sarcastic"]):
+                    if switch_personality_mode("roast"):
+                        set_eye_personality_mode("roast")  # Set eyes to roast mode
+                        reply = "Aight bet, roast mode activated. Hope you can handle the heat, bestie."
+                    else:
+                        reply = "Something went wrong switching modes, my bad."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["switch to therapist mode", "therapist mode", "give therapist vibes", "be supportive"]):
+                    if switch_personality_mode("therapist"):
+                        set_eye_personality_mode("therapist")  # Set eyes to therapist mode
+                        reply = "I've switched to therapist mode. I'm here to listen and support you. How are you feeling today?"
+                    else:
+                        reply = "I had trouble switching modes, sorry about that."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["switch to professional mode", "professional mode", "be professional", "business mode"]):
+                    if switch_personality_mode("professional"):
+                        set_eye_personality_mode("professional")  # Set eyes to professional mode
+                        reply = "I've switched to professional mode. I'm here to help you in a clear and friendly way. What can I assist you with today?"
+                    else:
+                        reply = "I had trouble switching to professional mode. Let me try that again."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["switch to normal mode", "normal mode", "go back to normal"]):
+                    if switch_personality_mode("normal"):
+                        set_eye_personality_mode("normal")  # Set eyes to normal mode
+                        reply = "Back to normal mode! What's good, bro?"
+                    else:
+                        reply = "Couldn't switch back, something's bugging out."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["what mode are you in", "current mode", "which mode"]):
+                    current_mode = get_current_mode()
+                    reply = f"I'm currently in {current_mode} mode. You can switch between normal, roast, therapist, or professional mode anytime!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                # ----- Eye Control Commands -----
+                elif any(phrase in cleaned_input for phrase in ["blink", "blink eyes", "wink"]):
+                    blink_eyes()
+                    reply = "There you go!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["wake up eyes", "open eyes"]):
+                    wake_eyes()
+                    reply = "Eyes wide open!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["close eyes", "sleepy eyes"]):
+                    sleep_eyes()
+                    reply = "Getting sleepy..."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["enable face tracking", "track my face", "follow me"]):
+                    enable_face_tracking()
+                    reply = "Face tracking enabled! I'll follow your movements."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["disable face tracking", "stop tracking", "look forward"]):
+                    disable_face_tracking()
+                    reply = "Face tracking disabled. Looking straight ahead."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["eye status", "how are your eyes", "eye check"]):
+                    get_eye_status()
+                    reply = "Checking my eye status..."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["focus", "pay attention", "be alert"]):
+                    set_eye_attention_level(90)
+                    reply = "Eyes focused and alert!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["relax", "be casual", "chill out"]):
+                    set_eye_attention_level(30)
+                    reply = "Taking it easy now."
+                    self.speak_and_interrupt(reply)
+                    continue
+                # ----- Media/Entertainment Commands -----
+                elif any(phrase in cleaned_input for phrase in ["youtube", "play video", "open youtube"]):
+                    reply = "I can't directly open YouTube yet, but I can search for videos! Try saying 'search for [what you want]' instead."
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["bluetooth", "connect bluetooth", "pair bluetooth"]):
+                    reply = "I can't control Bluetooth directly, but you can connect devices through your system settings, bro!"
+                    self.speak_and_interrupt(reply)
+                    continue
+                elif any(phrase in cleaned_input for phrase in ["play music", "music", "spotify"]):
+                    reply = "I can't play music directly yet, but I can search for songs! Try 'search for [song name]' or use your music app."
+                    self.speak_and_interrupt(reply)
+                    continue
+                else:
+                    # Handle all remaining inputs, even short ones that might be meaningful
+                    debug_print(f"Sending to GPT: '{cleaned_input}'")
+                    # context-aware chat
+                    try:
+                        context_msgs = self.build_context_messages(cleaned_input)
+                        self.add_history('user', cleaned_input)
+                        response_text = get_completion(context_msgs)
+                        debug_print(f"GPT Response: {response_text}")
+                        self.speak_and_interrupt(response_text)
+                        self.add_history('assistant', response_text)
+                        
+                        # Optional: Add occasional blinks during conversation for lifelike behavior
+                        if np.random.random() < 0.3:  # 30% chance to blink after response
+                            blink_eyes()
+                    except Exception as e:
+                        print(f"[ERROR] GPT request failed: {e}")
+                        # For very short inputs, provide more specific fallbacks
+                        if len(cleaned_input.strip()) <= 3:
+                            fallback_replies = [
+                                "I didn't quite catch that. Could you say a bit more?",
+                                "What's that about?",
+                                "Can you give me more details?",
+                                "I'm not sure what you mean. Can you elaborate?"
+                            ]
+                        else:
+                            fallback_replies = [
+                                "Sorry, I'm having trouble processing that right now.",
+                                "My brain's a bit foggy at the moment, can you try again?",
+                                "Hmm, I didn't quite catch that. What's up?",
+                                "Can you rephrase that? I'm not following."
+                            ]
+                        fallback = np.random.choice(fallback_replies)
+                        self.speak_and_interrupt(fallback)
+                # Reduced from 0.01 to 0.002 for faster response
+                time.sleep(0.002)
+
+# -------------------------
+# Main Execution
+# -------------------------
+if __name__ == "__main__":
+    print("🚀 Starting Pluto Bot...")
+    print(f"🔧 Platform: {platform.system()} {platform.machine()}")
+    if IS_RASPBERRY_PI:
+        print(f"🍓 Raspberry Pi detected with {AUDIO_SYSTEM} audio system")
+        print("🚀 Applying Pi 5 optimizations for maximum responsiveness...")
+    
+    # Raspberry Pi specific startup optimizations
+    if IS_RASPBERRY_PI:
+        try:
+            # Check available memory
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+                for line in meminfo.split('\n'):
+                    if 'MemTotal:' in line:
+                        total_mem_kb = int(line.split()[1])
+                        total_mem_gb = total_mem_kb / (1024 * 1024)
+                        print(f"🧠 Available RAM: {total_mem_gb:.1f} GB")
+                        break
+        except:
+            pass
+        
+        # Optimize system for audio processing
+        try:
+            # Set swappiness to 10 for better responsiveness (temporarily)
+            subprocess.run(['sudo', 'sysctl', 'vm.swappiness=10'], 
+                         capture_output=True, check=False)
+            debug_print("🚀 System swappiness optimized")
+        except:
+            pass
+    
+    # Preload common TTS responses for faster interactions
+    print("🚀 Preloading common responses for faster performance...")
+    threading.Thread(target=preload_common_responses, daemon=True).start()
+    
+    # Initialize Xiao ESP32-C3 communication on startup
+    try:
+        init_xiao_communication()
+    except Exception as e:
+        print(f"Xiao initialization error: {e}")
+    
+    try:
+        with sr.Microphone() as source:
+            print("🎤 Microphone initialized successfully")
+            conversation = ConversationManager(source)
+            conversation.run()
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down Pluto...")
+        
+        # Clean shutdown of MQTT
+        if mqtt_client and MQTT_CONNECTED:
+            print("📡 Disconnecting MQTT...")
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        
+        # Clean shutdown of audio
+        try:
+            audio_manager.stop_current_playback()
+            print("🔇 Audio system shutdown complete")
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"❌ Error starting Pluto: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Emergency cleanup
+        if mqtt_client:
+            try:
+                mqtt_client.loop_stop()
+                mqtt_client.disconnect()
+            except:
+                pass
+        
+        try:
+            audio_manager.stop_current_playback()
+        except:
+            pass
